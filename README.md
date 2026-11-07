@@ -154,8 +154,12 @@ older one) is ignored: usage never fails a session.
 
 ```sh
 go vet ./...
-go test ./...
+go test -race ./...
 ```
+
+CI (`.github/workflows/test.yml`) runs these and `gofmt` on every push to
+`master`. `internal/codex`'s tests run the JSON-RPC client against the test
+binary standing in for `codex app-server`.
 
 `TestLiveCodex` runs one turn on a real Codex, skipped unless
 `COHESION_ACTOR_CODEX_LIVE` names the binary:
