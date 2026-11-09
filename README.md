@@ -170,7 +170,6 @@ COHESION_ACTOR_CODEX_LIVE=$(which codex) go test -run TestLiveCodex -v ./interna
 
 ## Licence
 
-Copyright (C) 2026 Jackson Zamorano.
+Copyright (c) 2026 Jackson Zamorano.
 
-Licensed under the GNU Affero General Public License, version 3 only
-(`AGPL-3.0-only`). See [`LICENSE`](LICENSE).
+Licensed under the MIT License. See [`LICENSE`](LICENSE).
