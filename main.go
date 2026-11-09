@@ -99,7 +99,7 @@ func main() {
 func setup(directory, argument string, local bool, name string) error {
 	if name == "" {
 		host, _ := os.Hostname()
-		name = strings.TrimSuffix(host, ".local")
+		name = cohesion.GeneratedClientName(strings.TrimSuffix(host, ".local"), actor.Product)
 	}
 	var actors []actor.Entry
 	if existing, err := actor.LoadConfig(directory); err == nil {
