@@ -38,6 +38,10 @@ func fakeCodex(logPath string) {
 		params["threadId"] = "thread-1"
 		send(map[string]any{"method": method, "params": params})
 	}
+	notifyOn := func(thread, method string, params map[string]any) {
+		params["threadId"] = thread
+		send(map[string]any{"method": method, "params": params})
+	}
 	answers := map[string]chan json.RawMessage{}
 	var answersMu sync.Mutex
 	ask := func(id, method string, params map[string]any) json.RawMessage {
@@ -46,6 +50,15 @@ func fakeCodex(logPath string) {
 		answers[id] = reply
 		answersMu.Unlock()
 		params["threadId"] = "thread-1"
+		send(map[string]any{"id": id, "method": method, "params": params})
+		return <-reply
+	}
+	askOn := func(thread, id, method string, params map[string]any) json.RawMessage {
+		reply := make(chan json.RawMessage, 1)
+		answersMu.Lock()
+		answers[id] = reply
+		answersMu.Unlock()
+		params["threadId"] = thread
 		send(map[string]any{"id": id, "method": method, "params": params})
 		return <-reply
 	}
@@ -69,6 +82,30 @@ func fakeCodex(logPath string) {
 		case strings.Contains(prompt, "hang"):
 			<-interrupted
 			complete(turnID, "interrupted")
+		case strings.Contains(prompt, "delegate"):
+			spawn := func(threads []string, status string) map[string]any {
+				states := map[string]any{}
+				for _, thread := range threads {
+					states[thread] = map[string]any{"status": "running"}
+				}
+				return map[string]any{"type": "collabAgentToolCall", "id": "k1", "tool": "spawnAgent", "status": status, "prompt": "Map the db layer\nthen report", "model": "gpt-child", "receiverThreadIds": threads, "agentsStates": states}
+			}
+			notify("item/started", map[string]any{"turnId": turnID, "item": spawn([]string{}, "inProgress")})
+			notifyOn("child-1", "turn/started", map[string]any{"turn": map[string]any{"id": "ct1", "status": "inProgress"}})
+			notify("item/completed", map[string]any{"turnId": turnID, "item": spawn([]string{"child-1"}, "completed")})
+			if strings.Contains(prompt, "ask") {
+				reply := askOn("child-1", "req-c", "item/commandExecution/requestApproval", map[string]any{"turnId": "ct1", "itemId": "c9", "command": "bash -lc 'rm -rf db'", "cwd": "/w", "reason": "Clean"})
+				var decision struct{ Decision string }
+				_ = json.Unmarshal(reply, &decision)
+				notifyOn("child-1", "item/completed", map[string]any{"turnId": "ct1", "item": map[string]any{"type": "agentMessage", "id": "cm0", "text": "decision: " + decision.Decision}})
+			}
+			notifyOn("child-1", "item/started", map[string]any{"turnId": "ct1", "item": map[string]any{"type": "commandExecution", "id": "c1", "command": "bash -lc 'ls'", "cwd": "/w", "status": "inProgress", "commandActions": []any{}}})
+			notifyOn("child-1", "item/completed", map[string]any{"turnId": "ct1", "item": map[string]any{"type": "commandExecution", "id": "c1", "command": "bash -lc 'ls'", "cwd": "/w", "status": "completed", "commandActions": []any{}, "exitCode": 0}})
+			notifyOn("child-1", "item/completed", map[string]any{"turnId": "ct1", "item": map[string]any{"type": "agentMessage", "id": "cm1", "text": "Found it."}})
+			notifyOn("child-1", "thread/tokenUsage/updated", map[string]any{"turnId": "ct1", "tokenUsage": map[string]any{"last": map[string]any{"totalTokens": 50}, "modelContextWindow": 1000}})
+			notifyOn("child-1", "turn/completed", map[string]any{"turn": map[string]any{"id": "ct1", "status": "completed", "items": []any{}, "error": nil}})
+			notify("item/completed", map[string]any{"turnId": turnID, "item": map[string]any{"type": "subAgentActivity", "id": "s9", "kind": "completed", "agentThreadId": "child-1", "agentPath": "x"}})
+			complete(turnID, "completed")
 		case strings.Contains(prompt, "agent"):
 			notify("item/completed", map[string]any{"turnId": turnID, "item": map[string]any{"type": "subAgentActivity", "id": "s1", "kind": "started", "agentThreadId": "child-1", "agentPath": "x"}})
 			complete(turnID, "completed")
@@ -136,7 +173,6 @@ func fakeCodex(logPath string) {
 			if params.CollaborationMode != nil {
 				mode = params.CollaborationMode.Mode
 			}
-			defer func() {}()
 			go func() {
 				time.Sleep(10 * time.Millisecond)
 				play(turnID, prompt, mode)
@@ -177,7 +213,12 @@ func (c *fakeClient) lines() []string {
 	defer c.mu.Unlock()
 	var lines []string
 	for _, r := range c.reports {
+		// A subagent's reports read as its own: `[child-1] status idle`.
+		before := len(lines)
 		switch r.Kind {
+		case "launch":
+			launch := r.Launch
+			lines = append(lines, fmt.Sprintf("launch %q parent=%s message=%s type=%s model=%s background=%v", launch.Title, orNone(launch.Parent), idOrNone(launch.MessageID), orNone(launch.AgentType), orNone(launch.Model), launch.Background))
 		case "message":
 			content := r.Content
 			switch content.Kind {
@@ -205,8 +246,25 @@ func (c *fakeClient) lines() []string {
 		case "title":
 			lines = append(lines, "title "+r.Title)
 		}
+		if r.Subagent != "" && len(lines) > before {
+			lines[before] = "[" + r.Subagent + "] " + lines[before]
+		}
 	}
 	return lines
+}
+
+func orNone(text *string) string {
+	if text == nil {
+		return "-"
+	}
+	return *text
+}
+
+func idOrNone(id *int64) string {
+	if id == nil {
+		return "-"
+	}
+	return fmt.Sprint(*id)
 }
 
 func (c *fakeClient) waitFor(t *testing.T, want string) {
@@ -383,4 +441,73 @@ func TestResponseToAGoneRequestIsWords(t *testing.T) {
 	message := "Not now."
 	h.session.Hear(cohesion.UserContent{Kind: "permission", RequestID: 99, Decision: cohesion.Deny, Message: &message}, nil)
 	h.waitSent(t, "turn/start", "About your earlier request: no. Not now.")
+}
+
+func indexOf(lines []string, want string) int {
+	for i, line := range lines {
+		if line == want {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestSubagentIsLaunchedBeforeItsEvents(t *testing.T) {
+	h := newHarness(t, Record{Actor: "a", Mode: "auto", Titled: TitledGiven, Title: "T"})
+	h.session.Say("delegate this", nil)
+	h.client.waitFor(t, "status idle")
+	h.client.waitFor(t, "[child-1] status idle")
+	lines := h.client.lines()
+	// The collabAgentToolCall is message 1; the launch names it, and carries what the call said.
+	launch := indexOf(lines, `[child-1] launch "Map the db layer" parent=- message=1 type=- model=gpt-child background=true`)
+	// The child's turn began before the call said its thread: its launch still came first, and was said again with the message.
+	first := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "[child-1] ") {
+			first = i
+			break
+		}
+	}
+	if launch == -1 || first == -1 || launch > first {
+		t.Fatalf("the subagent wasn't launched first:\n%s", strings.Join(lines, "\n"))
+	}
+	for _, want := range []string{"[child-1] message toolUse Shell ls", "[child-1] end 2", "[child-1] message text Found it.", "[child-1] context 50/1000", "[child-1] status idle"} {
+		if indexOf(lines, want) == -1 {
+			t.Errorf("never reported %q:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "message") && strings.Contains(line, "Found it") {
+			t.Errorf("a subagent's words landed in the session's transcript: %q", line)
+		}
+	}
+	// A reconnect launches it again, with where it stands.
+	h.session.snapMu.Lock()
+	children := h.session.snap.children
+	h.session.snapMu.Unlock()
+	if len(children) != 1 || children[0].key != "child-1" || children[0].status != cohesion.Idle || children[0].launch.Launch.MessageID == nil {
+		t.Errorf("snapshot of subagents: %+v", children)
+	}
+}
+
+func TestSubagentRequestsGoInItsOwnTranscript(t *testing.T) {
+	h := newHarness(t, Record{Actor: "a", Mode: "auto", Titled: TitledGiven, Title: "T"})
+	h.session.Say("delegate and ask", nil)
+	h.client.waitFor(t, "[child-1] message permission rm -rf db")
+	h.client.waitFor(t, "[child-1] status needsAttention")
+	for _, line := range h.client.lines() {
+		if line == "status needsAttention" || line == "message permission rm -rf db" {
+			t.Fatalf("the child's request showed in the session: %q", line)
+		}
+	}
+	// Collab message is 1, the permission 2: answered by key, to the child.
+	if err := h.session.HearChild("child-1", cohesion.UserContent{Kind: "permission", RequestID: 2, Decision: cohesion.AllowForSession}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.client.waitFor(t, "[child-1] message text decision: acceptForSession")
+	h.client.waitFor(t, "[child-1] status working")
+	h.client.waitFor(t, "[child-1] status idle")
+	if err := h.session.HearChild("nobody", cohesion.UserContent{Kind: "text", Text: "x"}, nil); err == nil {
+		t.Error("an unknown subagent took a response")
+	}
 }

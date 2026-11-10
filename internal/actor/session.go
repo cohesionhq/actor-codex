@@ -88,6 +88,8 @@ type snapshot struct {
 	titled   string
 	title    string
 	process  *codex.Process
+	// The subagents launched, in order, for a reconnect to launch again.
+	children []childSnap
 }
 
 // Session is one actor session. Everything it does runs on its own loop, one
@@ -126,6 +128,14 @@ type Session struct {
 	// the session stays working for them; with the timer that makes it idle
 	// should that work end with no turn of Codex's to follow.
 	held *hold
+	// The subagents launched so far, by Codex's thread id for each, and the
+	// order they were launched in (a parent before its children).
+	children map[string]*child
+	order    []string
+	// What the launching tool calls said of the threads they name, and the
+	// spawns begun that name none yet.
+	calls    map[string]*call
+	spawning []spawn
 }
 
 type hold struct{ resume *time.Timer }
@@ -143,6 +153,8 @@ func NewSession(id int64, record Record, ctx SessionContext) *Session {
 		changes:    map[string][]FileUpdate{},
 		background: map[string]bool{},
 		childTurns: map[string]string{},
+		children:   map[string]*child{},
+		calls:      map[string]*call{},
 	}
 	t.snap = snapshot{status: cohesion.Idle, titled: record.Titled, title: record.Title}
 	go t.events.run()
@@ -163,6 +175,15 @@ func (t *Session) Hear(content cohesion.UserContent, images []cohesion.Image) {
 	t.events.push(func() { t.hear(content, images) })
 }
 
+// HearChild hands a subagent what the user said: the response to one of its
+// requests, as cohesiond sends it with the subagent's key. It fails when this
+// process has no such subagent, which the user sees.
+func (t *Session) HearChild(key string, content cohesion.UserContent, images []cohesion.Image) error {
+	done := make(chan error, 1)
+	t.events.push(func() { done <- t.hearChild(key, content, images) })
+	return <-done
+}
+
 // Stop stops the turn under way; the session is idle until the user says more.
 func (t *Session) Stop() { t.events.push(t.stop) }
 
@@ -180,13 +201,19 @@ func (t *Session) Resync(link *cohesion.Session) {
 	t.snapMu.Lock()
 	snap := t.snap
 	t.snapMu.Unlock()
-	if snap.status != cohesion.Working && snap.status != cohesion.NeedsAttention {
-		return
-	}
 	report := func(r cohesion.Report) {
 		if _, err := link.Report(t.ID, r); err != nil {
 			t.logf("resync refused: %v", err)
 		}
+	}
+	// Every subagent again, parents first, and where each stands: cohesiond
+	// settled the working ones idle when the last connection dropped.
+	for _, c := range snap.children {
+		report(c.launch)
+		report(cohesion.Report{Kind: "status", Subagent: c.key, Status: c.status})
+	}
+	if snap.status != cohesion.Working && snap.status != cohesion.NeedsAttention {
+		return
 	}
 	report(cohesion.Report{Kind: "status", Status: snap.status})
 	report(cohesion.Report{Kind: "progress", Progress: snap.progress})
@@ -444,6 +471,7 @@ func (t *Session) exited(st *stretch) {
 	t.stretch = nil
 	t.release()
 	t.background = map[string]bool{}
+	t.childrenGone(st)
 	if !deliberate && !t.stopping && (t.status == cohesion.Working || t.status == cohesion.NeedsAttention) {
 		why := "it exited"
 		if err := st.process.Err(); err != nil && !errors.Is(err, codex.ErrClosed) {
@@ -523,7 +551,7 @@ func (t *Session) notify(st *stretch, n codex.Notification) {
 	}
 	if params.ThreadID != "" && params.ThreadID != st.threadID {
 		// A subagent's own thread: its steps stay inside its tool use.
-		t.child(params, n.Method)
+		t.child(st, params, n.Method)
 		return
 	}
 	switch n.Method {
@@ -567,18 +595,6 @@ func (t *Session) notify(st *stretch, n codex.Notification) {
 	}
 }
 
-// child follows a subagent's thread: its turns, to interrupt on stop.
-func (t *Session) child(params threadParams, method string) {
-	switch method {
-	case "turn/started":
-		if params.Turn != nil {
-			t.childTurns[params.ThreadID] = params.Turn.ID
-		}
-	case "turn/completed":
-		delete(t.childTurns, params.ThreadID)
-	}
-}
-
 // working reports the session working, unless it waits on the user.
 func (t *Session) working() {
 	if t.status != cohesion.Working && len(t.waiting) == 0 {
@@ -601,6 +617,7 @@ func (t *Session) started(item Item) {
 	if !u.held {
 		u.shown = append(u.shown, t.show(content, nil))
 	}
+	t.noteCall("", item, t.uses)
 	progress := Progress(item, t.ctx.Cwd)
 	t.setProgress(&progress)
 }
@@ -617,6 +634,7 @@ func (t *Session) completed(st *stretch, item Item) {
 		t.plan = item.Text
 		return
 	case "collabAgentToolCall":
+		t.noteCall("", item, t.uses)
 		for thread, state := range item.AgentsStates {
 			if state.Status == "pendingInit" || state.Status == "running" {
 				t.background[thread] = true
@@ -628,6 +646,7 @@ func (t *Session) completed(st *stretch, item Item) {
 			t.hold(st)
 		}
 	case "subAgentActivity":
+		t.activity(st, "", item)
 		switch item.Kind {
 		case "started", "interacted":
 			t.background[item.AgentThreadID] = true
@@ -642,30 +661,7 @@ func (t *Session) completed(st *stretch, item Item) {
 	if !IsTool(item.Type) {
 		return
 	}
-	// What a tool gave back, failed or not: a held tool use is reported now,
-	// with its images, and the tool has ended.
-	u, ok := t.uses[item.ID]
-	if !ok {
-		// Begun before this process heard of it: shown now, as it ended.
-		u = &use{held: true}
-	}
-	delete(t.uses, item.ID)
-	delete(t.changes, item.ID)
-	images := t.imagesOf(item)
-	if u.held {
-		// Its summary is surest now.
-		u.content = ToolUse(item, t.ctx.Cwd)
-	}
-	// One reported already that gave images after all is shown again, with them.
-	if u.held || len(images) > 0 {
-		u.shown = append(u.shown, t.show(u.content, images))
-	}
-	for _, id := range u.shown {
-		// A refused one has nothing to end.
-		if id != -1 {
-			t.report(cohesion.Report{Kind: "end", MessageID: id})
-		}
-	}
+	t.finishTool("", t.uses, t.changes, item)
 }
 
 // imagesOf is the images an item shows: one Codex viewed or drew, or an MCP tool's.
@@ -839,6 +835,10 @@ func (t *Session) request(st *stretch, r codex.ServerRequest) {
 		_ = st.process.RespondError(r.ID, "Malformed request: "+err.Error())
 		return
 	}
+	if params.ThreadID != "" && params.ThreadID != st.threadID {
+		t.childRequest(st, r, params)
+		return
+	}
 	asked := Request(r.Method, params, t.changes[params.ItemID], t.ctx.Cwd)
 	id := t.reportWait(asked)
 	if id == -1 {
@@ -940,6 +940,13 @@ func (t *Session) stop() {
 		}
 	}
 	st := t.stretch
+	// What a subagent waits on is abandoned with the session's turn.
+	for _, c := range t.children {
+		for id, w := range c.waiting {
+			delete(c.waiting, id)
+			w.answer(nil)
+		}
+	}
 	if st == nil || !busy {
 		return
 	}
@@ -1089,6 +1096,11 @@ func (t *Session) setLocalProgress(progress *string) {
 // message for one image, so a refused one goes again without them. It
 // returns the message's id, or -1 when refused.
 func (t *Session) show(content cohesion.SaidContent, images []cohesion.Image) int64 {
+	return t.showTo("", content, images)
+}
+
+// showTo is `show` in subagent `sub`'s transcript, or the session's when "".
+func (t *Session) showTo(sub string, content cohesion.SaidContent, images []cohesion.Image) int64 {
 	kept, dropped := Sendable(images)
 	for _, why := range dropped {
 		t.logf("an image can't be shown: %s", why)
@@ -1096,30 +1108,35 @@ func (t *Session) show(content cohesion.SaidContent, images []cohesion.Image) in
 	unshown := len(dropped)
 	var id int64
 	if len(kept) > 0 {
-		message, err := t.ctx.Client.Report(t.ID, cohesion.Report{Kind: "message", Content: &content, Images: kept}).Wait()
+		message, err := t.ctx.Client.Report(t.ID, cohesion.Report{Kind: "message", Subagent: sub, Content: &content, Images: kept}).Wait()
 		if err != nil {
 			t.logf("update with images refused: %v", err)
 			unshown += len(kept)
-			id = t.reportWait(content)
+			id = t.reportWaitTo(sub, content)
 		} else {
 			id = message.ID
 		}
 	} else {
-		id = t.reportWait(content)
+		id = t.reportWaitTo(sub, content)
 	}
 	if unshown > 0 && id != -1 {
 		note := "(An image couldn't be shown here.)"
 		if unshown > 1 {
 			note = fmt.Sprintf("(%d images couldn't be shown here.)", unshown)
 		}
-		t.report(text(note))
+		t.report(cohesion.Report{Kind: "message", Subagent: sub, Content: &cohesion.SaidContent{Kind: "text", Text: note}})
 	}
 	return id
 }
 
 // reportWait reports a message and waits for its id, or -1 when refused.
 func (t *Session) reportWait(content cohesion.SaidContent) int64 {
-	message, err := t.ctx.Client.Report(t.ID, cohesion.Report{Kind: "message", Content: &content}).Wait()
+	return t.reportWaitTo("", content)
+}
+
+// reportWaitTo is `reportWait` in subagent `sub`'s transcript, or the session's when "".
+func (t *Session) reportWaitTo(sub string, content cohesion.SaidContent) int64 {
+	message, err := t.ctx.Client.Report(t.ID, cohesion.Report{Kind: "message", Subagent: sub, Content: &content}).Wait()
 	if err != nil || message == nil {
 		if err != nil {
 			t.logf("update refused: %v", err)

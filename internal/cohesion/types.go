@@ -68,6 +68,9 @@ type Call struct {
 	// sendActorSessionMessage.
 	MessageID int64        `json:"message_id,omitempty"`
 	Content   *UserContent `json:"content,omitempty"`
+	// sendActorSessionMessage: the key of the subagent whose request the
+	// content responds to, as its launch named it; empty for the session.
+	Subagent string `json:"subagent,omitempty"`
 }
 
 // Answer is the answer to one question.
@@ -245,10 +248,32 @@ type ContextUsage struct {
 	TotalTokens int64 `json:"total_tokens"`
 }
 
+// Launch is what an actor says of a subagent it launched, in a `launch`
+// report: an upsert, sent before any other report about the subagent.
+type Launch struct {
+	// What it is doing; not blank.
+	Title string
+	// The launching subagent's key; nil is the session itself.
+	Parent *string
+	// The toolUse message one level up that launched it.
+	MessageID *int64
+	// What kind of subagent it is, as the actor names them.
+	AgentType *string
+	// The model it runs on; nil is the session's.
+	Model      *string
+	Background bool
+}
+
 // Report is one thing an actor reports about a session, tagged by Kind:
-// message, status, progress, end, context or title.
+// launch, message, status, progress, end, context or title. With Subagent
+// set, it is about that subagent of the session (progress only marks it
+// working) rather than the session; a launch always names one.
 type Report struct {
 	Kind string
+	// The key the actor gave the subagent; empty for the session itself.
+	Subagent string
+	// launch.
+	Launch *Launch
 	// message.
 	Content *SaidContent
 	Images  []Image
@@ -267,7 +292,17 @@ type Report struct {
 // fields is the report's own fields, as an actorSessionUpdate carries them.
 func (r Report) fields() map[string]any {
 	fields := map[string]any{"kind": r.Kind}
+	if r.Subagent != "" {
+		fields["subagent"] = r.Subagent
+	}
 	switch r.Kind {
+	case "launch":
+		fields["title"] = r.Launch.Title
+		fields["parent"] = r.Launch.Parent
+		fields["message_id"] = r.Launch.MessageID
+		fields["agent_type"] = r.Launch.AgentType
+		fields["model"] = r.Launch.Model
+		fields["background"] = r.Launch.Background
 	case "message":
 		fields["content"] = r.Content
 		if len(r.Images) > 0 {

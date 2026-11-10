@@ -31,6 +31,7 @@ keeps the session → thread mapping so a restart resumes too.
 | `internal/codex` | `codex app-server` over stdio: JSONL JSON-RPC without the `jsonrpc` field, requests matched by id, notifications and server requests handed to a `Handler`, and `initialize` (experimental API on, streamed deltas opted out). |
 | `internal/actor/host.go` | `Host.OnCall` answers cohesiond's four calls; it opens or picks up the `Session` for each (from `sessions.json`, or from Cohesion's transcript) and resyncs running sessions on reconnect. |
 | `internal/actor/session.go` | `Session`: one thread. Everything it does runs on its own event loop (`queue`), one event at a time: calls from the host, Codex's notifications and requests, timers. `open` starts a stretch; `notify` turns items and turns into reports; `request` turns approvals into requests and waits on the user (`waiting`). |
+| `internal/actor/subagents.go` | Subagents: a notification with a thread id that isn't the session's is a subagent's. The first one (or the `spawnAgent` call that names it) launches it (`launch` report: title from the call's prompt, `message_id` of the call's toolUse, parent from the launching call or the thread's source, `background`, `model`, `agent_type` from the thread's role), waited on, before anything else about it; then its tool uses, text, context, title, status and requests go to its own transcript, addressed by thread id. `HearChild` answers its requests; a killed or ended turn is `idle`. |
 | `internal/actor/translate.go` | Pure functions between Codex and Cohesion's transcript kinds: `ToolUse`, `Progress`, `DisplayName`, `UnwrapShell`, `Request` (approvals, questions, MCP forms), `Response` (the user's response back to Codex), `Describe`. |
 | `internal/actor/offers.go` | The modes (`Modes`: approval policy, sandbox, collaboration mode) and models (`AvailableModels`, `ActorModels`). |
 | `internal/actor/usage.go` | Context usage per session (`ContextOf`) and `Usage`: the account's rate limits, pulled and taken from updates, said for every actor. |
@@ -59,7 +60,9 @@ keeps the session → thread mapping so a restart resumes too.
   itself; the rules are in `docs/actors.md`, "Statuses".
 - **Resync**: `Session.Resync` reads a locked snapshot (status, progress,
   title), never the loop, which may be blocked on a report waiting for the
-  very session that is resyncing.
+  very session that is resyncing. It also launches every subagent again,
+  parents first, and says each one's status (cohesiond settles a client's
+  working subagents idle when it drops).
 
 ## Dependencies
 

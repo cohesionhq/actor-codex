@@ -260,7 +260,8 @@ func (c *Client) flush() {
 
 		var message *ActorSessionMessage
 		var err error
-		if next.unsure && next.report.Kind == "message" {
+		// A subagent's transcript is cohesiond's own session, which this client has no id for.
+		if next.unsure && next.report.Kind == "message" && next.report.Subagent == "" {
 			message, err = stored(session, next.sessionID, next.report.Content)
 		}
 		if err == nil && message == nil {

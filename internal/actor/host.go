@@ -48,7 +48,7 @@ func (h *Host) OnCall(call cohesion.Call) error {
 		if call.Content == nil {
 			return fmt.Errorf("the message says nothing")
 		}
-		if err := h.hear(call.SessionID, actor, *call.Content, call.Images); err != nil {
+		if err := h.hear(call.SessionID, actor, *call.Content, call.Images, call.Subagent); err != nil {
 			return err
 		}
 	case "stopActorSession":
@@ -141,7 +141,15 @@ func (h *Host) setMode(sessionID int64, identifier *string) error {
 
 // hear hands a session what the user said, picking the session up from disk after
 // a restart, or from Cohesion's transcript when this client never had it.
-func (h *Host) hear(sessionID int64, actor Entry, content cohesion.UserContent, images []cohesion.Image) error {
+func (h *Host) hear(sessionID int64, actor Entry, content cohesion.UserContent, images []cohesion.Image, subagent string) error {
+	// A response to a subagent's request goes to that subagent. One lives
+	// only in its session's Codex process, so there is nothing to recover it from.
+	if subagent != "" {
+		if session := h.session(sessionID); session != nil {
+			return session.HearChild(subagent, content, images)
+		}
+		return fmt.Errorf("subagent %s of session %d is no longer running here", subagent, sessionID)
+	}
 	if session := h.session(sessionID); session != nil {
 		session.Hear(content, images)
 		return nil

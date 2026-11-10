@@ -37,6 +37,7 @@ type Item struct {
 	} `json:"result"`
 	// collabAgentToolCall.
 	Prompt            *string                            `json:"prompt"`
+	Model             *string                            `json:"model"`
 	ReceiverThreadIDs []string                           `json:"receiverThreadIds"`
 	AgentsStates      map[string]struct{ Status string } `json:"agentsStates"`
 	// subAgentActivity.
